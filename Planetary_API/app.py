@@ -3,13 +3,27 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import Column, Integer, String, Float, Boolean
 import os
 from flask_marshmallow import Marshmallow
+from flask_jwt_extended import JWTManager, jwt_required, create_access_token
+from flask_mail import Mail, Message
 
 app = Flask(__name__) #__name__ means it will take the name from the name of this current script
 basedir = os.path.abspath(os.path.dirname(__file__)) # This finds the directory name with this current file and then it finds the absolute directory of it from the machine and stores it
+
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(basedir, "planets.db")
+app.config["JWT_SECRET_KEY"] = "super-secret-key"
+
+app.config["MAIL_SERVER"] = "smtp.gmail.com"
+app.config["MAIL_USERNAME"] = os.environ.get("MAIL_USERNAME")
+app.config["MAIL_PASSWORD"] = os.environ.get("MAIL_PASSWORD")
+app.config["MAIL_PORT"] = 587
+app.config["MAIL_USE_TLS"] = True
+app.config["MAIL_USE_SSL"] = False
+app.config["MAIL_DEFAULT_SENDER"] = os.environ.get("MAIL_DEFAULT_SENDER")
 
 db = SQLAlchemy(app)
 ma = Marshmallow(app)
+jwt = JWTManager(app)
+mail = Mail(app)
 
 #################################################################################### DB CLI COMMANDS ####################################################################################
 @app.cli.command("create_db") # This is a command line argument that triggers an action
@@ -66,7 +80,7 @@ class User(db.Model):
     last_name = Column(String)
     email = Column(String, unique=True)
     password = Column(String)
-    username = Column(String, unique=True)
+    
 
 
 class Planet(db.Model):
@@ -78,6 +92,9 @@ class Planet(db.Model):
     radius = Column(Float)
     mass = Column(Float)
     distance = Column(Float)
+
+    def get_fields(self):
+        return ["planet_id", "planet_name", "planet_type", "home_star", "radius", "mass", "distance"]
 
 
 #################################################################################### Serialization Classes ####################################################################################
@@ -134,10 +151,71 @@ def parameter_matching(param1: str, param2: int):
 
 
 @app.route("/planets", methods=["GET"])
-def get_planet():
+def get_all_planets():
     planets_list = Planet.query.all() # This function will query the table created by the Planet Class
     call_result =  planets_schema.dump(planets_list) # You need to serialize the data in order to turn it into a JSON format. Serialization is a process that turns tables into JSON
-    return jsonify(call_result.data)
+    return jsonify(call_result)
+
+@app.route("/get_planet/<string:planet_name>")
+def get_planet_via_name(planet_name: str):
+    planet = Planet.query.filter_by(planet_name=planet_name).first()
+    print(planet)
+
+    if planet:
+        planet_data = planet_schema.dump(planet)
+        return jsonify(planet_data)
+    else:
+        return jsonify(message="A planet by that name does not exist in the directory. Please re-check the spelling or consider adding it to our directory.")
+
+
+@app.route("/planet_details/<int:planet_id>")
+def get_planet_via_id(planet_id: int):
+    planet = Planet.query.filter_by(planet_id=planet_id).first()
+
+    if planet:
+        planet_information = planet_schema.dump(planet)
+        return jsonify(planet_information)
+    else:
+        return jsonify(message="There is no planet that exists with that particular ID")
+
+@app.route("/add_planet/", methods=["POST"])
+@jwt_required
+def add_planet():
+    distance = request.form["distance"]
+    home_star = request.form["home_star"]
+    mass = request.form["mass"]
+    planet_id = request.form["planet_id"]
+    planet_name = request.form["planet_name"]
+    planet_type = request.form["planet_type"]
+    radius = request.form["radius"]
+    
+    check = Planet.query.filter_by(planet_id=planet_id).first()
+    if check:
+        return jsonify(message="A planet by this id already exists."), 409
+    else:
+        new_planet = Planet(planet_id=planet_id, planet_name=planet_name, planet_type=planet_type, radius=radius, mass=mass, home_star=home_star, distance=distance)
+        db.session.add(new_planet)
+        db.session.commit()
+        return jsonify(message="This planet has now been added")
+
+@app.route("/update_planet/", methods=["PUT"])
+@jwt_required
+def planet_update():
+    if request.is_json:
+        planet_name = request.json["planet_name"]
+        planet_distance = request.json["distance"]
+    else:
+        planet_name = request.form["planet_name"]
+        planet_distance = request.form["distance"]
+    
+    planet = Planet.query.filter_by(planet_name=planet_name)
+
+    if planet:
+        planet.distance = planet_distance
+        db.session.commit()
+        return jsonify(message="This planet has had its distance updated")
+    else:
+        return jsonify(message="This planet does not exist")
 
 @app.route("/register", methods=["POST"])
 def register_user():
@@ -151,11 +229,47 @@ def register_user():
         last_name = request.form["last_name"]
         email = request.form["email"]
         password = request.form["password"]
-        username = request.form["username"]
-        new_user = User(first_name=first_name, last_name=last_name, email=email, password=password, username=username)
+
+        new_user = User(first_name=first_name, last_name=last_name, email=email, password=password)
         db.session.add(new_user)
         db.session.commit()
         return jsonify("New User successfully registered"), 201 # 201 = new record
+
+
+@app.route("/login", methods=["POST"])
+def login_user():
+    if request.is_json: # This checks if the format of the request is in JSON
+        email = request.json["email"]
+        password = request.json["password"]
+    else:   # This handles the case when the request has a form format
+        email = request.form["email"]
+        password = request.form["password"]
+    
+    user = User.query.filter_by(email=email, password=password).first()
+    print(user)
+
+    if user:
+        access_token = create_access_token(identity= email)
+        return jsonify(message="You have successfully logged in", access_token=access_token)
+    else:
+        return jsonify(message="Incorrect email or password"), 401
+
+
+@app.route("/retrieve-password", methods=["GET"])
+def retrieve_password():
+    email = request.form["email"]
+    user = User.query.filter_by(email=email).first()
+
+    if user:
+        # Send Email with Password to User
+        msg = Message("Planetary API Password Reset Request", recipients=[email])
+        msg.body = f"You recently attempted to sign into the Planetary API, but forgot your username/ password. This is the password for your account {user.password}"
+        mail.send(msg)
+        return jsonify(messsage="Message has been sent!")
+    else:
+        return jsonify(message="No user exists with that email. Try again"), 401
+
+
 
 
 if __name__ == "__main__":
